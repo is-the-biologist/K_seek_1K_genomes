@@ -4,14 +4,18 @@ import pandas as pd
 import numpy as np
 from sklearn.cluster import SpectralClustering
 from sklearn.metrics import rand_score, adjusted_rand_score
+from scipy.spatial.distance import pdist
 from scipy.stats import chi2
 from operator import itemgetter
 import networkx as nx
 from community import community_louvain
 from multiprocessing import Pool
 from statsmodels.stats.multitest import fdrcorrection
-from itertools import combinations
-
+from itertools import combinations, product
+import math
+import time
+import leidenalg as la
+import igraph
 
 class ClusterTandems:
     """
@@ -21,38 +25,20 @@ class ClusterTandems:
     The k-seek .rep files are used to generate an N x N symmetrical matrix, where each cell represent the number of reads
     that have monomer A in read 1 and monomer B in read 2 from the paired-end reads. We compute this for each sample
     individually and also sum these values across all samples to get values for the complete data set. These matrices will
-    be the primary data used to generate the graphs for the spectral clustering.
-
-    1. Divisive Spectral:
-        This module uses a "divisive hierarchical spectral clustering" approach to cluster together tandem monomers that form larger,
-        more complex higher order repeats. This approach is highly inspired by Altemose, 2014 where a similar strategy was
-        employed on Hsat2,3 monomers to detect higher order repeats. The novel feature of this being our use of affinity matrix
-        and diversity of monomers.
+    be the primary data used to generate the graphs for the LOUVAIN clustering.
 
 
 
-        Step 1.
-        Use the matrices of the paired-end reads to generate and Observed / Expected probability of finding two monomers on the
-        same read fragment as P(A&B) / P(A)*P(B). We calculate the P(A&B) as the frequency of the 'chimeric' read with A and B.
-        Then P(A) as frequency of all reads with A monomer and P(B) as frequency of all reads with monomer B. Thus generating
-        values that represent how more likely two monomers are to be found on the same fragment relative to random chance.
+    Louvain:
+    Louvain clustering uses modularity optimization on, in this case, a weighted network to create a set of
+    communities that partition the graph optimally. In this case the edge-weights are the E/O ratios and the
+    communities are clusters that represent tandems that are found to form higher-order interspersed structures
+    more often.
 
-        Step 2.
-        Use a divisive spectral clustering approach to generate clusters of monomers that are often found in the same fragment.
-        This approach uses the Obsv/Exp probability matrices from step 1 as input to a Spectral Clustering algorithm. We use
-        this matrix as an affinity matrix from which to construct the graph for spectral clustering where nodes represent
-        monomers and edges represent their relative probability of being found in the same fragment, such that edges in the
-        graph that connect nodes that are more likely to be found in the same fragment by random chance will have higher weights
-        (O/E > 1). We perform recursive clustering wherein we perform sequential binary splits on the graph until the edges of
-        each cluster have a median O/E > 1. This means that in each cluster the median enrichment of monomers being found in the
-        same fragment is positive. The result is a collection of monomers that on the whole are more likely to be found together
-        in the same sets of fragments than by chance, suggesting co-localization and higher order structures.
+    Leiden:
+    This is similar to Louvain, but performs better. Louvain is prone to arbitrarily badly connected communities, but
+    Leiden fixes this by
 
-    2. Louvain:
-        Louvain clustering uses modularity optimization on, in this case, a weighted network to create a set of
-        communities that partition the graph optimally. In this case the edge-weights are the E/O ratios and the
-        communities are clusters that represent tandems that are found to form higher-order interspersed structures
-        more often.
 
     """
     def __init__(self):
@@ -96,7 +82,47 @@ class ClusterTandems:
                 cluster = NTs[cluster_labels == c]
                 print(",".join(cluster))
 
-    def louv(self, affinity_matrix, pval_matrix, sample, correction_type='bh'):
+    def leiden(self, affinity_matrix, pval_matrix, sample, correction_type='bh', save=True):
+        # simple correction: if p-value > alpha then we set value of odds to 1
+        # logic is simple H0 fails to reject therefore b=c
+        if correction_type == 'bonf':
+            # bonferoni correction:
+            alpha = 0.05 / len(np.triu_indices(pval_matrix.shape[0])[0])
+            affinity_matrix[pval_matrix > alpha] = 1
+
+        elif correction_type == 'bh':
+            # benjamini-hochberg
+            alpha_pass, q = fdrcorrection(pval_matrix.values[np.triu_indices(pval_matrix.shape[0])], alpha=0.05)
+            # fdr corrected  p-values:
+            Q = np.zeros(shape=pval_matrix.shape)
+            Q[np.triu_indices(pval_matrix.shape[0])] = q
+            Q = np.where(Q, Q, Q.T)
+            Q = pd.DataFrame(data=Q, columns=pval_matrix.columns, index=pval_matrix.columns)
+            affinity_matrix[Q > 0.05] = 1
+        else:
+            sys.stderr.write("Incorrect correction type selected. Try: 'bh' or 'bonf'\n")
+            sys.exit()
+        A = affinity_matrix.copy().values
+
+        g = igraph.Graph.Adjacency(A.tolist())
+        partition = la.find_partition(g, la.ModularityVertexPartition, seed=42)
+        # partition = community_louvain.best_partition(networkx.from_pandas_adjacency(A), random_state=42)
+
+        NTs, cluster_labels = zip(*[(affinity_matrix.columns[partition[c]], np.asarray([c for k in range(len(partition[c]))])) for c in range(len(partition))])
+
+        NTs = np.concatenate(NTs)
+        cluster_labels = np.concatenate(cluster_labels)
+
+        cluster_df = pd.DataFrame(data={'tandems': NTs, 'label': cluster_labels})
+        output_name = os.path.split(sample)[-1].split('.')[0]
+        if save:
+            cluster_df.to_csv(
+                f'/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/LEIDEN_2022_10_20/{output_name}.louvain.clusters.csv',
+                index=None)
+        else:
+            return cluster_df
+
+    def louv(self, affinity_matrix, pval_matrix, sample, correction_type='bh', save=True):
 
         # simple correction: if p-value > alpha then we set value of odds to 1
         #logic is simple H0 fails to reject therefore b=c
@@ -123,7 +149,10 @@ class ClusterTandems:
 
         cluster_df = pd.DataFrame(data={'tandems': NTs, 'label': cluster_labels})
         output_name = os.path.split(sample)[-1].split('.')[0]
-        cluster_df.to_csv(f'/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/LOUVAIN_CLUSTERS_2022_08_17/{output_name}.louvain.clusters.csv', index=None)
+        if save:
+            cluster_df.to_csv(f'/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/LOUVAIN_CLUSTERS_2022_08_17/{output_name}.louvain.clusters.csv', index=None)
+        else:
+            return cluster_df
 
     def calcIndependence(self, interspersed, regularize=False):
         #calculates the Observed / Expected ratio of the number of tandem monomers
@@ -152,8 +181,11 @@ class ClusterTandems:
                 #chi2 = (b-c)**2 / (b+c)
                 b = O*np.sum(total_links)
                 c = E*np.sum(total_links)
-                chi_test = (b-c)**2 / (b+c)
-                pval = chi2.sf(chi_test, df=1)
+                if b + c == 0: #handle zeros
+                    pval = 1
+                else:
+                    chi_test = (b-c)**2 / (b+c)
+                    pval = chi2.sf(chi_test, df=1)
                 PVAL[i, j] = pval
 
         #regularization alternative method is to fully connect the graph by adding a pseudocount to the affinity matrix
@@ -167,7 +199,7 @@ class ClusterTandems:
 
         return JS_df, PVAL_df
 
-    def invokeCluster(self, sample, clustering_algo='louvain'):
+    def invokeCluster(self, sample, clustering_algo='leiden'):
 
         #load sample
         link_matrix = np.load(sample)
@@ -179,8 +211,10 @@ class ClusterTandems:
             self.recurClustering(affinity_matrix=independence_prob)
         elif clustering_algo == 'louvain':
             self.louv(affinity_matrix=independence_prob, sample=sample, pval_matrix=pval)
+        elif clustering_algo == 'leiden':
+            self.leiden(affinity_matrix=independence_prob, sample=sample, pval_matrix=pval)
         else:
-            sys.stderr.write('Incorrect argument of clustering type, try: "spectral" or "louvain"\n')
+            sys.stderr.write('Incorrect argument of clustering type, try: "spectral", "leiden" or "louvain"\n')
 
 class ClusterAnalysis:
 
@@ -191,11 +225,13 @@ class ClusterAnalysis:
 
     Functions to calculate Rand Index and Adjusted Rand Index as pairwise comparisons between individuals.
 
+    Functions to QC using BLAST outputs to genome assemblies.
     """
 
-    def __init__(self):
-        self.tandem_list = np.asarray([k.split("/")[0] for k in pd.read_csv('/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/scripts/2022_08_15_tandem_list.txt', header=None)[0]])
-        self.sample_names = pd.read_csv("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/scripts/1k_CRAM_sample_sheet.final.txt", header=None)[0]
+    def __init__(self, tandem_dir='/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/scripts/2022_08_15_tandem_list.txt',
+                 sample_sheet = "/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/scripts/1k_CRAM_sample_sheet.final.txt"):
+        self.tandem_list = np.asarray([k.split("/")[0] for k in pd.read_csv(tandem_dir, header=None)[0]])
+        self.sample_names = pd.read_csv(sample_sheet, header=None)[0]
 
     def readCluster(self, sample):
         """
@@ -262,7 +298,7 @@ class ClusterAnalysis:
         # is quite small
         gc_depth = {d[0]: (d[3] if d[1] >= 10000 else med_value) for d in
                     depth_summary.values}  # assign bins to dict
-        counts = np.load(os.path.join("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/interspersion/intrsp_counts",counts_matrix) )
+        counts = np.load(os.path.join("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/counts",counts_matrix) )
 
         gc_bins = np.asarray([((b + 1) / 100) for b in range(100)])
         get_gc_bins = lambda gc: min(gc_bins[float(gc) <= gc_bins])
@@ -280,7 +316,7 @@ class ClusterAnalysis:
 
         corrected_counts = counts / correction_factor
 
-        np.save(f"/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/interspersion/GC_corrected_counts/{f}.GC.corrected.interspersed.counts.npy", corrected_counts)
+        np.save(f"/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/GC_corrected_counts/{f}.GC.corrected.interspersed.counts.npy", corrected_counts)
 
     def GC_correction(self, threads):
         myPool = Pool(threads)
@@ -292,25 +328,118 @@ class ClusterAnalysis:
         Compute the mean copy-number of each interspersion junction using the GC corrected read-depth.
         :return:
         """
-        mean_CN = np.zeros(shape=(125,125)).astype(float)
+
+        mean_CN = np.zeros(shape=(126,126)).astype(float)
+        #to calcualate the weighted mean ie only use CN of individuals that have the tandem we can make a weight matrix
+        weight = np.zeros(shape=(126,126))
         for sample in self.sample_names.values:
-            A = np.load(os.path.join("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/interspersion/GC_corrected_counts", sample+".GC.corrected.interspersed.counts.npy"))
+            A = np.load(os.path.join("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/GC_corrected_counts", sample+".GC.corrected.interspersed.counts.npy"))
             mean_CN = mean_CN + A
+            weight = weight + (A > 0 )*1
+        mean_CN = mean_CN / weight
 
-        mean_CN = mean_CN / 2504
+        np.save('1k_genomes.meanCN.global.weighted.interspersion.npy', mean_CN)
 
-        np.save('1k_genomes.meanCN.global.interspersion.npy', mean_CN)
+    def QC_clusters(self, blast_output, pid_min=100, eval_min=1):
+        counts_matrix = pd.DataFrame(data=np.zeros(shape=(len(self.tandem_list), len(self.tandem_list)) ), columns=self.tandem_list, index=self.tandem_list)
+
+        with open(blast_output, 'r') as myBLAST:
+            for line in myBLAST:
+                KMER1, KMER2 = line.split("\t")[0].split("+")
+                QSTART = int(line.split("\t")[6])
+                QEND = int(line.split("\t")[7])
+                PID = float(line.split("\t")[2])
+                EVAL = float(line.split("\t")[10])
+                #lengths of each kmer sequence to find out where junction is
+
+                L1 = math.ceil(20/len(KMER1)) * len(KMER1)
+                #L2 = math.ceil(20/len(KMER2)) * len(KMER2)
+
+                #QSTART <= L1 - kmer1 length & QEND > L2 + kmer2 length & PID = 100%:
+                #this gets only BLAST hits that are perfect matches and go over junction
+                JSTART = L1 - len(KMER1)
+                JEND = L1 + len(KMER2)
+
+                if QSTART <= JSTART and QEND >= JEND and PID >= pid_min and EVAL <= eval_min:
+
+                    counts_matrix.loc[KMER1, KMER2] += 1
+                    counts_matrix.loc[KMER2, KMER1] += 1
+
+        counts_matrix.to_csv("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/BLAST/2022_10_20_kmer.FR.T2T.blast.counts.pid_100_eval_1e-2.csv")
+
+    def junction_Locations(self, blast_output, cluster_labels, pid_min=100, eval_min=1e-2):
+        counts_matrix = pd.DataFrame(data=np.zeros(shape=(len(self.tandem_list), len(self.tandem_list))),
+                                     columns=self.tandem_list, index=self.tandem_list)
+
+        with open(blast_output, 'r') as myBLAST:
+            for line in myBLAST:
+                KMER1, KMER2 = line.split("\t")[0].split("+")
+
+                if KMER1 in cluster_labels and KMER2 in cluster_labels:
+                    QSTART = int(line.split("\t")[6])
+                    QEND = int(line.split("\t")[7])
+                    PID = float(line.split("\t")[2])
+                    EVAL = float(line.split("\t")[10])
+                    # lengths of each kmer sequence to find out where junction is
+
+                    L1 = math.ceil(20 / len(KMER1)) * len(KMER1)
+                    # L2 = math.ceil(20/len(KMER2)) * len(KMER2)
+
+                    # QSTART <= L1 - kmer1 length & QEND > L2 + kmer2 length & PID = 100%:
+                    # this gets only BLAST hits that are perfect matches and go over junction
+                    JSTART = L1 - len(KMER1)
+                    JEND = L1 + len(KMER2)
+
+                    if QSTART <= JSTART and QEND >= JEND and PID >= pid_min and EVAL <= eval_min:
+
+                        pass
+
+    def computeCluster_distance(self):
+
+        #This may be just too much of costly computation to do in the naiive way -- would need to think of something much smarter
+        annots = pd.read_csv("../PacBio/A.kmer.blast.loc_annots.tsv", sep="\t", header=None)
+
+        for group in annots.groupby(1):
+            S = time.time()
+            V = group[1][5].values
+            print(len(V)**2)
+            #A = np.asarray(list(product(V, V)))
+            #print(A[:,0] - A[:,1])
+            #Vi = V[:, None] #convert to 2d array
+            #D = pdist(Vi)
+            E = time.time()
+
+            #print(np.mean(D) )
+            print(E-S)
+            break
+
+    def concat_Clusters(self):
+        for fname in self.sample_names:
+            pass
+
+    def junction_SFS(self):
+
+        freq_matrix = np.zeros(shape=(126,126))
+        for fname in self.sample_names:
+            fp = f"/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/counts/{fname}.interspersed.counts.npy"
+            junction_matrix = np.load(fp)
+            freq_matrix = freq_matrix + (junction_matrix > 0)*1
+        np.save("/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/kmer.junctions.sfs.npy", freq_matrix)
+
 
 if __name__ == '__main__':
-
+    pass
     #cluster
-    harch = ClusterTandems()
-    sample_list = ["/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/counts/"+sample+".interspersed.counts.npy" for sample in pd.read_csv('/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/scripts/1k_CRAM_sample_sheet.final.txt', header=None)[0].values]
-    myPool = Pool(30)
-    myPool.map(harch.invokeCluster, sample_list)
+    #harch = ClusterTandems()
+    #sample_list = ["/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/counts/"+sample+".interspersed.counts.npy" for sample in pd.read_csv('/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/scripts/1k_CRAM_sample_sheet.final.txt', header=None)[0].values]
+    #myPool = Pool(30)
+    #myPool.map(harch.invokeCluster, sample_list)
 
     #analyze patterns
-    cAnal = ClusterAnalysis()
-    cAnal.pairwiseComparisons()
 
-
+    #cAnal = ClusterAnalysis()
+    #cAnal.pairwiseComparisons()
+    #cAnal.junction_SFS()
+    #cAnal.GC_correction(threads=30)
+    #cAnal.computeCN_means()
+    #cAnal.QC_clusters(blast_output='/fs/cbsuclarkfs1/storage/is372/human_kmer/full_kseek_run/RUN_2022_06_28/interspersion/BLAST/2022_10_18.kmer.concats.FR.blast.tsv', pid_min=100, eval_min=1e-2)
